@@ -1,272 +1,167 @@
-#Importing the necessary libraries:
+#!/usr/bin/env python3
+"""Annotate high-quality SNVs using spliced, strand-aware CDS sequences.
 
+Reports one representative transcript per VCF record, not exhaustive transcript effects.
+"""
 import argparse
-import os
+import csv
+import logging
+from collections import Counter, defaultdict
+from functools import lru_cache
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 from Bio import SeqIO
 from Bio.Seq import Seq
-from matplotlib import pyplot as plt
-from collections import defaultdict, Counter
-from pyfaidx import Fasta
-import logging
 
-#Setting up Logger:
+LOG = logging.getLogger("genvar")
 
-logging.basicConfig(filename = "error_log.log", level = logging.INFO,
-                    format = '%(asctime)s - %(levelname)s - %(message)s')
 
-#Setting up the Command Line Parser:
+def read_annotations(gff_path):
+    transcripts = defaultdict(list)
+    bins = defaultdict(set)
+    with open(gff_path, encoding="utf-8") as handle:
+        for line in handle:
+            if line.startswith("#"):
+                continue
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) < 9 or cols[2] != "CDS" or cols[6] not in ("+", "-"):
+                continue
+            attributes = dict(part.split("=", 1) for part in cols[8].split(";") if "=" in part)
+            parents = attributes.get("Parent", "").split(",")
+            if not parents or not parents[0] or cols[7] not in ("0", "1", "2"):
+                continue
+            chrom, start, end, strand, phase = cols[0], int(cols[3]), int(cols[4]), cols[6], int(cols[7])
+            for parent in parents:
+                feat = (chrom, start, end, strand, phase)
+                transcripts[parent].append(feat)
+                for window in range((start - 1) // 10000, (end - 1) // 10000 + 1):
+                    bins[(chrom, window)].add(parent)
+    return transcripts, bins
 
-def parse_args():
-    
-    """This Function Helps to Interact with the Script Through the Command Line."""
-    
-    parser = argparse.ArgumentParser(description = "Processing the VCF, GFF and Genome Fasta Files" )
-    parser.add_argument("--vcf", required = True, help = "Provide VCF Filepath")
-    parser.add_argument("--gff", required = True, help = "Provide GFF Filepath")
-    parser.add_argument("--fasta", required = True, help = "Provide Genome Fasta Filepath")
-    return parser.parse_args()
 
-#Function to Handle the GFF file:
+def annotate_variant(chrom, pos, ref, alt, transcripts, bins, fasta, sequence_for):
+    candidates = sorted(bins.get((chrom, (pos - 1) // 10000), ()))
+    overlapping = False
+    for parent in candidates:
+        segments = transcripts[parent]
+        if not any(c == chrom and a <= pos <= b for c, a, b, _, _ in segments):
+            continue
+        overlapping = True
+        try:
+            cds, locations, initial_phase, strand = sequence_for(parent)
+            offset = next(
+                (start_index + (pos - a if strand == "+" else b - pos) - initial_phase)
+                for a, b, start_index in locations if a <= pos <= b
+            )
+            if offset < 0:
+                raise ValueError("Variant lies in incomplete 5' codon")
+            codon_start = (offset // 3) * 3
+            codon = cds[codon_start:codon_start + 3]
+            expected_ref = ref if strand == "+" else str(Seq(ref).complement())
+            alt_on_cds = alt if strand == "+" else str(Seq(alt).complement())
+            if len(codon) != 3 or any(b not in "ACGT" for b in codon):
+                raise ValueError("Incomplete or ambiguous reference codon")
+            if cds[offset] != expected_ref:
+                raise ValueError(f"VCF REF does not match transcript: {ref}")
+            alternate_codon = codon[:offset % 3] + alt_on_cds + codon[offset % 3 + 1:]
+            original_aa = str(Seq(codon).translate())
+            alternate_aa = str(Seq(alternate_codon).translate())
+            consequence = "Synonymous" if original_aa == alternate_aa else "Non-Synonymous"
+            return [consequence, parent, codon_start // 3 + 1, original_aa, alternate_aa]
+        except (ValueError, KeyError, IndexError) as exc:
+            LOG.warning("Could not annotate %s:%s for %s: %s", chrom, pos, parent, exc)
+            continue
+    if overlapping:
+        return ["Unclassified", "NA", "NA", "NA", "NA"]
+    return ["Non-coding", "NA", "NA", "NA", "NA"]
 
-def GFF_file_handler(path_to_gff):
-    
-    """Handles the GFF file and extracts the coding sequence (CDS) regions."""
-    
-    gff_content = []
-    with open(path_to_gff) as file:
-        for line in file:
-            if not line.startswith("#"):
-                sections = line.strip().split('\t')
-                
-                #Extracting Coding Sequence Regions Only
-                
-                if sections[2] == "CDS":
-                    
-                    #Storing only information of relevance:
-                    
-                    gff_content.append({
-                        "sequence_id": sections[0],
-                        "start": int(sections[3]),
-                        "end": int(sections[4]),
-                        "strand": sections[6],
-                        "attributes": sections[8]
-                    })
-    return gff_content
 
-#Function to Handle the VCF file:
+def main():
+    parser = argparse.ArgumentParser(description="Annotate high-quality SNVs against spliced CDS models")
+    parser.add_argument("--vcf", required=True)
+    parser.add_argument("--gff", required=True)
+    parser.add_argument("--fasta", required=True)
+    args = parser.parse_args()
 
-def VCF_file_handler(path_to_vcf, gff_content, fasta):
-    
-    """This function handles a VCF file to categorize the variants into: Non-coding, Synonymous and Non-Synonymous Variants."""
-    
-    #Initiating Empty List to Store Results and Tracker to Count Variants of Poor Confidence:
-    
-    results = []
-    poor_quality_count = 0 
-    
-    #Prepping the File to Write Output Too:
-    
-    with open(path_to_vcf) as vcf, open("Output_Variants.tsv", 'w') as output_tsv:
-        output_tsv.write("Chrom\tPos\tRef\tAlt\tType\tTranscript\tProtein Location\tRef AA\tAlt AA\n")
+    logging.basicConfig(filename="error_log_v2.log", level=logging.INFO,
+                        format="%(asctime)s - %(levelname)s - %(message)s")
+    transcripts, bins = read_annotations(args.gff)
+    fasta = SeqIO.to_dict(SeqIO.parse(args.fasta, "fasta"))
 
+    @lru_cache(maxsize=2048)
+    def sequence_for(parent):
+        features = transcripts[parent]
+        chrom, _, _, strand, initial_phase = features[0]
+        if any(c != chrom or direction != strand for c, _, _, direction, _ in features):
+            raise ValueError("Inconsistent CDS chromosome or strand")
+        features = sorted(features, key=lambda feature: feature[1], reverse=(strand == "-"))
+        initial_phase = features[0][4]
+        pieces, locations = [], []
+        cumulative = -initial_phase
+        offset = 0
+        for i, (c, start, end, direction, phase) in enumerate(features):
+            if i and phase != (-cumulative) % 3:
+                raise ValueError("Inconsistent internal CDS phase")
+            piece = str(fasta[c].seq[start - 1:end]).upper()
+            if strand == "-":
+                piece = str(Seq(piece).reverse_complement())
+            pieces.append(piece)
+            locations.append((start, end, offset))
+            offset += len(piece)
+            cumulative += len(piece)
+        return "".join(pieces)[initial_phase:], locations, initial_phase, strand
+
+    counts = Counter()
+    discarded_quality = 0
+    with open(args.vcf, encoding="utf-8") as vcf, open("Output_Variants_v2.tsv", "w", newline="", encoding="utf-8") as output:
+        writer = csv.writer(output, delimiter="\t")
+        writer.writerow(["Chrom", "Pos", "Ref", "Alt", "Type", "Transcript", "Protein Location", "Ref AA", "Alt AA"])
         for line in vcf:
-            if line.startswith("#"):  #Searching for header row
+            if line.startswith("#"):
                 continue
-            
-            sections = line.strip().split("\t")
-            
-            # Handling Missing Fields in VCF data:
-            
-            if len(sections) < 6:
-                logging.error(f" VCF file supposed to have atleast 6 columns, but only has {len(sections)}): {line.strip()}")
-                continue 
-            
-            # Ensuring the VCF Fields are Loaded Correctly:
-            
-            chrom = sections[0]
-            position = int(sections[1])
-            original = sections[3] if len(sections) > 3 else "N/A"
-            alternative = sections[4] if len(sections) > 4 else "N/A"
-            quality = float(sections[5]) if len(sections) > 5 else 0.0  # If missing, value is accomodated
-
-            # Ensuring Variants are of Good Quality:
-            
-            if quality <= 20:
-                poor_quality_count += 1
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 8:
+                LOG.warning("Skipping malformed VCF record")
                 continue
-
-            # Creating Dictionary for Variants:
-            
-            variant = {"Chromosome": chrom, "Position": position, "Original": original, "Alternate": alternative}
-            coding_region = coding_region_checker(variant, gff_content)
-
-            if coding_region:
-                original_amino, ugly_amino = amino_seq_checker(variant, coding_region, fasta)
-                
-                #Ensuring Sequences are Read in the Correct Direction using Strand for Reference:
-                
-                if coding_region["strand"] == "+":
-                    protein_location = (variant["Position"] - coding_region["start"]) // 3 + 1
-                elif coding_region["strand"] == "-":
-                    protein_location = (coding_region["end"] - variant["Position"]) // 3 + 1
-                else:
-                    protein_location = "N/A"
-                
-                #Extracting the Required Info from Annotations in GFF File:
-                
-                transcript_id = coding_region["attributes"].split(";")[0].split("=")[-1]
-                
-                #Categorizing the Variants into Respective Sets:
-                
-                variant_type = "Non-Synonymous" if original_amino != ugly_amino else "Synonymous"
+            chrom, pos_str, ref, alt, qual_str = fields[0], fields[1], fields[3].upper(), fields[4].upper(), fields[5]
+            try:
+                qual = float(qual_str)
+                pos = int(pos_str)
+            except ValueError:
+                LOG.warning("Skipping record with missing or invalid quality/position")
+                continue
+            if qual <= 20:
+                discarded_quality += 1
+                continue
+            if len(ref) != 1 or len(alt) != 1 or ref not in "ACGT" or alt not in "ACGT":
+                LOG.warning("Skipping non-SNV record %s:%s", chrom, pos)
+                continue
+            try:
+                genome_base = str(fasta[chrom].seq[pos - 1:pos]).upper()
+            except (KeyError, IndexError) as exc:
+                LOG.warning("Missing reference position %s:%s: %s", chrom, pos, exc)
+                annotation = ["Unclassified", "NA", "NA", "NA", "NA"]
             else:
-                transcript_id, protein_location, original_amino, ugly_amino = "NA", "NA", "NA", "NA"
-                variant_type = "Non-coding"
+                if genome_base != ref:
+                    LOG.warning("Reference mismatch at %s:%s, VCF=%s, FASTA=%s", chrom, pos, ref, genome_base)
+                    annotation = ["Unclassified", "NA", "NA", "NA", "NA"]
+                else:
+                    annotation = annotate_variant(chrom, pos, ref, alt, transcripts, bins, fasta, sequence_for)
+            writer.writerow([chrom, pos, ref, alt, *annotation])
+            counts[annotation[0]] += 1
 
-            # Store the result and write to output file
-            
-            results.append(variant_type)
-            output_tsv.write(f"{chrom}\t{position}\t{original}\t{alternative}\t{variant_type}\t{transcript_id}\t{protein_location}\t{original_amino}\t{ugly_amino}\n")
+    LOG.info("Low quality variants excluded: %s", discarded_quality)
+    LOG.info("Classifications: %s", dict(counts))
+    plt.bar(list(counts), list(counts.values()))
+    plt.xlabel("Variant classification")
+    plt.ylabel("Count")
+    plt.tight_layout()
+    plt.savefig("Variant_Numbers_v2.png")
+    plt.close()
+    print("Results written to Output_Variants_v2.tsv")
+    print("Classification counts:", dict(counts))
 
-    return results, poor_quality_count
-
-#Function to Verify Coding Region:
-
-def coding_region_checker(variant, gff_content):
-    
-    """This function verifies whether a variant exists within a coding region."""
-    
-    for section in gff_content:
-        
-        #Checking if Variant is within a CDS region using boolean logic:
-        
-        if section["sequence_id"] == variant["Chromosome"] and section["start"] <= variant["Position"] <= section["end"]:
-            return section
-    return None
-
-#Function to Determine the Change in Amino Acids due to Variants:
-
-def amino_seq_checker(variant, coding_region, fasta):
-    
-    """This Function verifies and notes the amino acid change caused by a genetic variant."""
-    
-    try:
-        reference_sequence = fasta[coding_region["sequence_id"]][coding_region["start"]-1:coding_region["end"]].seq 
-        translated_sequence = Seq(reference_sequence).translate()
-
-        #Calculating the Position of the Mutation in Protein Sequence:
-        
-        protein_position = (variant["Position"] - coding_region["start"]) // 3
-        
-        #Ensuring that the Position of the Protein is Always Within Range:
-        
-        protein_position = min(protein_position, len(translated_sequence) - 1) 
-        
-        #Updating Logger if Protein Position is not Within Valid Range:
-        
-        if not (0 <= protein_position < len(translated_sequence)):
-            logging.error(f"Invalid position: {protein_position}")
-            return "N/A", "N/A"
-
-        #Obtaining the Original Amino Acid:
-        
-        original_amino = translated_sequence[protein_position]
-
-        #Casting the Sequence from String to a List:
-        
-        mutated_sequence = list(reference_sequence)
-        
-        #Obtaining the position of the Mutation:
-        
-        mutation_index = variant["Position"] - coding_region["start"]
-
-        #Checking if the Mutation is within Bounds and Logs an Error Otherwise:
-        
-        if mutation_index < 0 or mutation_index >= len(mutated_sequence):
-            logging.error(f"Mutation index {mutation_index} out of range of sequence length {len(mutated_sequence)}")
-            return "N/A", "N/A"
-        
-        #Accounting for Deletions, if not then we Replace with the Alternate:
-        
-        if variant["Alternate"] != "-":
-            mutated_sequence[mutation_index] = variant["Alternate"]
-        
-        #Converting the Sequence with the Mutation into a String and Translating:
-        
-        mutated_sequence = "".join(mutated_sequence)
-        mutated_translation = Seq(mutated_sequence).translate()
-
-        #Checking if Protein Position is within Valid Range otherwise Logs an Error:
-        
-        if protein_position < 0 or protein_position >= len(mutated_translation):
-            logging.error(f"Protein position {protein_position} out of range in mutated sequence length {len(mutated_translation)}.")
-            return "N/A", "N/A"
-        
-        #Obtaining the Amino Acid from the Mutated Position:
-        
-        ugly_amino = mutated_translation[protein_position]
-
-        return original_amino, ugly_amino
-    
-    #Stores Null for any Error and updates Logs:
-    
-    except Exception as e:
-        logging.error(f"Error in computing amino acid")
-        return "N/A", "N/A"
-    
-#Configuring Final Output Format and Logger Logs:
-
-def final_output_generator(results, poor_quality_count):
-    
-    """This Function ensures that all the output, i.e., Summary Statistics, log results and a plot to visualise variant distribution, is formatted and shown to us clearly."""
-    
-    total = Counter(results)
-    
-    #Prepping Trackers to Log Number of Variants in Each Category:
-    
-    non_coding_count = total.get("Non-coding", 0)
-    synonymous_count = total.get("Synonymous", 0)
-    nonsynonymous_count = total.get("Non-Synonymous", 0)
-    
-    #Visualising the Classification Distribution:
-    
-    plt.bar(total.keys(), total.values())
-    plt.xlabel("Variant_Type")
-    plt.ylabel("Amount")
-    plt.title("Proportion_of_Variant_Types")
-    plt.savefig("Variant_Numbers.png")
-    
-    #Updating Log Messages to Show all Desirable Info:
-    
-    logging.info(f"Low Quality Variants (Quality <= 20): {poor_quality_count}")
-    logging.info(f"Variants that have been categorized: {len(results)} Variants")
-    logging.info(f" - Non-coding variants: {non_coding_count}")
-    logging.info(f" - Synonymous variants: {synonymous_count}")
-    logging.info(f" - Non-Synonymous variants: {nonsynonymous_count}")
-    logging.info("Results saved: View Output_Variants.tsv and Variant_Numbers.png")
-
-#Main function:
 
 if __name__ == "__main__":
-    args = parse_args()
-    
-    #Accounting for Missing Files:
-
-    missing_files = [file for file in [args.vcf, args.gff, args.fasta] if not os.path.exists(file)]
-    if missing_files:
-        logging.error(f"Missing files: \n{missing_files}")
-        exit(1)
-
-    try:
-        
-        #Putting it all Together and calling Functions in Order:
-        
-        gff_content = GFF_file_handler(args.gff)
-        fasta = Fasta(args.fasta)
-        
-        results, poor_quality_count = VCF_file_handler(args.vcf, gff_content, fasta)
-        final_output_generator(results, poor_quality_count)
-        
-    except Exception as e:
-        logging.error(f"An error occured: {e}")
-        
+    main()
